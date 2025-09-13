@@ -1,0 +1,103 @@
+# iot_poc.py
+import time, random, joblib, os
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+from imblearn.over_sampling import SMOTE
+
+# توليد بيانات
+def gen_row(device_id, attack=False):
+
+    if not attack:
+        bytes_per_sec = random.gauss(200, 50)  # الطبيعي
+        pkts_per_sec  = max(1, random.gauss(20, 5))
+        avg_pkt_size  = bytes_per_sec / max(1, pkts_per_sec)
+        dst_ports = random.randint(1, 4)
+    else:
+        # هجوم: ترافيك عالي أو مسح منافذ
+        kind = random.choice(['ddos','scan'])
+        if kind == 'ddos':
+            bytes_per_sec = random.gauss(3000, 800)
+            pkts_per_sec  = max(10, random.gauss(400, 120))
+            avg_pkt_size  = bytes_per_sec / max(1, pkts_per_sec)
+            dst_ports = random.randint(1, 3)
+        else:
+            bytes_per_sec = random.gauss(150, 60)
+            pkts_per_sec  = max(1, random.gauss(60, 20))
+            avg_pkt_size  = bytes_per_sec / max(1, pkts_per_sec)
+            dst_ports = random.randint(50, 300)
+
+    return {
+        'device_id': device_id,
+        'bytes_per_sec': max(0.0, bytes_per_sec),
+        'pkts_per_sec': max(0.0, pkts_per_sec),
+        'avg_pkt_size': max(1.0, avg_pkt_size),
+        'dst_ports': dst_ports,
+        'label': 'attack' if attack else 'normal'
+    }
+
+def generate_dataset(n_devices=10, normal_per_device=200, attack_per_device=30):
+    rows=[]
+    for d in range(n_devices):
+        for _ in range(normal_per_device):
+            rows.append(gen_row(f'dev{d}', attack=False))
+        for _ in range(attack_per_device):
+            rows.append(gen_row(f'dev{d}', attack=True))
+    df = pd.DataFrame(rows)
+    return df
+
+#  تجهيز البيانات وتدريب نموذج
+def train_model(df):
+    X = df[['bytes_per_sec','pkts_per_sec','avg_pkt_size','dst_ports']]
+    y = df['label']
+
+    X_res, y_res = SMOTE(random_state=42).fit_resample(X, y)
+    X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.25, random_state=42)
+    scaler = StandardScaler().fit(X_train)
+    X_train_s = scaler.transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    clf = RandomForestClassifier(n_estimators=150, random_state=42, n_jobs=-1)
+    clf.fit(X_train_s, y_train)
+
+    y_pred = clf.predict(X_test_s)
+    print("==== Eval report ====")
+    print(classification_report(y_test, y_pred))
+    print("Confusion matrix:")
+    print(confusion_matrix(y_test, y_pred))
+
+    # حفظ النموذج والمقياس
+    joblib.dump(clf, 'rf_model.joblib')
+    joblib.dump(scaler, 'scaler.joblib')
+    return clf, scaler
+
+#  ياحكي البيانات  
+def stream_simulation(clf, scaler, n_events=200, devices=10):
+    print("\nStarting simulated stream... (CTRL+C to stop)\n")
+    for i in range(n_events):
+        #يشيك اذا كان فيه هجوم
+        device = f'dev{random.randint(0, devices-1)}'
+        is_attack = random.random() < 0.12  # 12% احتمالية الخطاء وممكن تتغير
+        row = gen_row(device, attack=is_attack)
+        X = np.array([[row['bytes_per_sec'], row['pkts_per_sec'], row['avg_pkt_size'], row['dst_ports']]])
+        Xs = scaler.transform(X)
+        prob_attack = clf.predict_proba(Xs)[0][ list(clf.classes_).index('attack') ] if 'attack' in clf.classes_ else clf.predict_proba(Xs)[0,1]
+        if prob_attack > 0.6:  # عتبة اقدر للتعديل
+            print(f"[ALERT] device={device} score={prob_attack:.2f} features={X.flatten().tolist()} (real_attack={is_attack})")
+        else:
+            print(f"ok device={device} score={prob_attack:.2f}")
+        time.sleep(0.2)  # عشان يريح واقدر اخذ النتائج بشكل معقول
+
+#  main
+if __name__ == '__main__':
+    print("Generating dataset...")
+    df = generate_dataset(n_devices=8, normal_per_device=180, attack_per_device=25)
+    df.to_csv('sim_flows.csv', index=False)
+    print("Training model...")
+    clf, scaler = train_model(df)
+    print("Saved model -> rf_model.joblib , scaler -> scaler.joblib")
+    print("Starting stream simulation (200 events)...")
+    stream_simulation(clf, scaler, n_events=200, devices=8)
